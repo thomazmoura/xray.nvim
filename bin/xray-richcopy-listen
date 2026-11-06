@@ -1,0 +1,32 @@
+#!/bin/sh
+# On the PC you ssh from: puts on its clipboard, as text/html, what a Neovim over SSH copies
+# with <leader>mc (lua/xray/richcopy.lua). Listens on a Unix socket the PC's ssh
+# forwards to the remote machine (RemoteForward, see the README); each connection sends the
+# HTML then closes its write side, and gets "ok" back once wl-copy or xclip took it.
+#
+#   xray-richcopy-listen [socket]   default: $XDG_RUNTIME_DIR/xray-richcopy.sock
+set -eu
+
+if [ "${1:-}" = "--set" ]; then
+  # One connection: the HTML on stdin. wl-copy and xclip stay in the background to serve
+  # the copy: kept off the connection, or it would only close at the next copy
+  file=$(mktemp)
+  trap 'rm -f "$file"' EXIT
+  cat >"$file"
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null; then
+    wl-copy --type text/html <"$file" >/dev/null 2>&1 || exit 1
+  elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null; then
+    xclip -selection clipboard -t text/html <"$file" >/dev/null 2>&1 || exit 1
+  else
+    echo "xray-richcopy-listen: needs wl-copy (Wayland) or xclip (X11)" >&2
+    exit 1
+  fi
+  echo ok
+  exit 0
+fi
+
+command -v socat >/dev/null || { echo "xray-richcopy-listen: needs socat" >&2; exit 1; }
+socket=${1:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR or pass the socket path}/xray-richcopy.sock}
+self=$(readlink -f "$0")
+umask 077
+exec socat "UNIX-LISTEN:$socket,fork,unlink-early,mode=600" "EXEC:$self --set"
