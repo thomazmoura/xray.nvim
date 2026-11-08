@@ -107,7 +107,7 @@ function M.send(path, data, callback)
     end)
   end
   timer:start(TIMEOUT, 0, function()
-    finish("no answer on " .. path .. " in time")
+    finish("timed out waiting on " .. path)
   end)
   pipe:connect(path, function(err)
     if err then
@@ -118,6 +118,11 @@ function M.send(path, data, callback)
         return finish(read_err)
       elseif chunk then
         table.insert(chunks, chunk)
+        -- Done once it says so: socat may keep the connection open a while after its
+        -- command exited (its -t, which xray-open-listen sets long for the phone)
+        if table.concat(chunks):match("^ok\n") then
+          finish()
+        end
       else
         finish()
       end

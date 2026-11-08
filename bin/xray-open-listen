@@ -42,8 +42,9 @@ if [ "${1:-}" = "--open" ]; then
     fi
   fi
   command -v xdg-open >/dev/null || { echo "xray-open-listen: needs xdg-open" >&2; exit 1; }
-  # Detached, off the connection: the browser outlives it
-  setsid xdg-open "$url" </dev/null >/dev/null 2>&1 &
+  # Detached, off the connection: the browser outlives it. In a subshell, so it is not a
+  # child of this script: socat would keep the connection open until -t ran out for it
+  (setsid xdg-open "$url" </dev/null >/dev/null 2>&1 &)
   echo ok
   exit 0
 fi
