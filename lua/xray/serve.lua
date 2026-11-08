@@ -322,17 +322,25 @@ function M.open(target, opts)
   local client = require("xray.client")
   local message = opts and opts.message or "Open on your device"
   -- Both answers (opened, copied) are awaited before showing the URL once
-  local pending, opened, copied = 2, false, nil
+  local pending, opened, copied, why = 2, false, nil, nil
   local function done()
     pending = pending - 1
     if pending > 0 then
       return
     end
     local text = opened and "Opened on your device" or message
-    vim.notify(("[xray] %s%s: %s"):format(text, copied and (" (" .. copied .. ")") or "", url), vim.log.levels.INFO)
+    local notes = vim.tbl_filter(function(note)
+      return note ~= nil
+    end, { copied, why })
+    local suffix = #notes > 0 and (" (" .. table.concat(notes, "; ") .. ")") or ""
+    vim.notify(("[xray] %s%s: %s"):format(text, suffix, url), why and vim.log.levels.WARN or vim.log.levels.INFO)
   end
   client.open_url(url, function(open_err)
     opened = open_err == nil
+    -- No socket: no forward set up, the URL is only shown and copied as meant
+    if open_err and not open_err:match("^no ") then
+      why = "not opened, " .. open_err .. (client.stale(open_err) and (": " .. client.STALE_HINT) or "")
+    end
     done()
   end)
   --- Copy to the + register (OSC 52 over SSH)

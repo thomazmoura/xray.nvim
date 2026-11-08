@@ -42,13 +42,46 @@ local subcommands = {
       vim.notify("[xray] Cannot open " .. target .. ": " .. err, vim.log.levels.ERROR)
     end
   end,
+  -- :Xray check: how files and links would open on your device, and which of the sockets
+  -- its ssh forwards answer (connected to only: nothing is opened or copied)
+  check = function()
+    local serve, client = require("xray.serve"), require("xray.client")
+    local lines = {
+      ("remote: %s (serve.mode %s)"):format(serve.remote(), require("xray").config().serve.mode),
+      ("Termux in front: %s"):format(client.termux_in_front()),
+      ("URLs: http://%s:%d/…, listening on %s"):format(
+        serve.host(),
+        require("xray").config().serve.port,
+        serve.address()
+      ),
+      ("links to localhost open as: %s"):format(serve.rewrite_localhost("http://localhost/")),
+    }
+    local roles = {
+      { "open", "browser (PC)" },
+      { "termux_open", "browser (phone)" },
+      { "termux_copy", "clipboard (phone)" },
+      { "richcopy", "rich copy (PC)" },
+    }
+    local paths, pending = client.paths(), #roles
+    local states = {}
+    for i, role in ipairs(roles) do
+      client.probe(paths[role[1]], function(state)
+        states[i] = ("%s: %s %s"):format(role[2], paths[role[1]], state)
+        pending = pending - 1
+        if pending == 0 then
+          vim.list_extend(lines, states)
+          vim.notify("[xray] " .. table.concat(lines, "\n[xray] "), vim.log.levels.INFO)
+        end
+      end)
+    end
+  end,
 }
 
 vim.api.nvim_create_user_command("Xray", function(cmd)
   local name = table.remove(cmd.fargs, 1)
   local run = subcommands[name or ""]
   if not run then
-    vim.notify("[xray] :Xray preview|copy|open", vim.log.levels.ERROR)
+    vim.notify("[xray] :Xray preview|copy|open|check", vim.log.levels.ERROR)
     return
   end
   run(cmd.fargs, cmd)

@@ -32,6 +32,7 @@ xray sets no keymaps. Map what you use:
 | `require("xray.preview").toggle_current()` | `:Xray preview` | Previews of this buffer on/off (outside Markdown: of every buffer) |
 | `require("xray.richcopy").copy_buffer(first, last)` | `:[range]Xray copy` | The buffer, or lines `first`–`last`, as rich text |
 | `require("xray.open").open(path)` | `:Xray open [file]` | A file or link on your device (locally: `vim.ui.open`) |
+| | `:Xray check` | How files and links open on your device from here, and which forwarded sockets answer |
 
 Rich copy only makes sense in Markdown buffers, e.g.:
 
@@ -207,9 +208,13 @@ serve = {
 
 The server then listens on the address that name resolves to, on the machine it is one of
 its own (its Tailscale address, say), and on `127.0.0.1` with `localhost` URLs everywhere
-else: the same config can go to every machine. Set `serve.bind` (or `$XRAY_SERVE_BIND`) to
-listen on another address (`"0.0.0.0"`: all of them), and the URLs name `host` whatever it
-resolves to. The URLs are then open to every device on that network that can reach the
+else: the same config can go to every machine. A name this machine resolves to `127.0.0.1`
+counts too (`127.0.0.1 dev.internal` in its `/etc/hosts`): for a machine the devices reach
+through a tunnel, another machine that answers as `dev.internal` and forwards its ports to
+this one's `localhost`. The URLs name `dev.internal`, the server stays on `127.0.0.1`.
+
+Set `serve.bind` (or `$XRAY_SERVE_BIND`) to listen on another address (`"0.0.0.0"`: all of
+them), and the URLs name `host` whatever it resolves to. The URLs are then open to every device on that network that can reach the
 port: their random part is what keeps the files private.
 
 Links to this machine's `localhost` (`127.0.0.1`, `[::1]`) opened over SSH, a web app you
@@ -217,6 +222,10 @@ run here linked from an e-mail, say, name that host too (`http://localhost:5000/
 `http://dev.internal:5000/`): your device has a `localhost` of its own. Set
 `serve.localhost` (or `$XRAY_SERVE_LOCALHOST`) for another name than `host`. The app has to
 listen on that network too.
+
+With `serve.ui_open = true`, `vim.ui.open` does the same over SSH: `gx` on a link or a
+file, and the plugins that open things with it, open on your device, links to `localhost`
+renamed. Locally, it is left as it was.
 
 ### In the device's browser
 
@@ -236,10 +245,23 @@ one more Unix socket back, answered over there by something that opens each URL 
     SYSTEM:'read -r url; case $url in http://*|https://*|mailto:*) termux-open-url "$url" && echo ok;; esac'
   ```
 
-  with `RemoteForward /tmp/xray-open-%r.sock /data/data/com.termux/files/usr/tmp/xray-open.sock`.
+  with `RemoteForward /tmp/xray-open-termux-%r.sock /data/data/com.termux/files/usr/tmp/xray-open.sock`:
+  a socket of its own, so the PC's connection and the phone's never take each other's.
   Android lets Termux start the browser while it is in front, as it is while you type in it.
 
-Set `serve.open_socket` if the forwarded socket is not `/tmp/xray-open-<user>.sock`.
+With Termux in front (the tmux client in front, or `LC_TERMINAL=Termux` outside tmux), the
+phone's socket is tried first, then the PC's. And when you ssh from the phone into the PC's
+tmux, and from there on into the host, `bin/xray-open-listen` on the PC hands each URL on to
+the phone while Termux is in front of the PC's own tmux, through the phone's socket forwarded
+to the PC (`$XRAY_TERMUX_OPEN_SOCKET`, else `/tmp/xray-open-termux-<user>.sock`). Set
+`serve.open_socket` and `serve.termux_open_socket` for other paths than
+`/tmp/xray-open-<user>.sock` and `/tmp/xray-open-termux-<user>.sock`.
+
+A socket that is there but does not answer was left by an ssh connection gone: another
+connection to the host forwarded the same path over the one still open, then closed. xray
+says so as it shows the URL. Reconnect, or, for an ssh master (ControlMaster) still running,
+run `bin/xray-setup-client` again on the PC: it forwards the sockets of its masters anew.
+`:Xray check` shows which sockets answer.
 
 ### Setup scripts
 
@@ -254,8 +276,10 @@ Set `serve.open_socket` if the forwarded socket is not `/tmp/xray-open-<user>.so
     RemoteForward /tmp/xray-open-%r.sock /run/user/%i/xray-open.sock
   ```
 
-  Run it again to change the hosts (it rewrites the same block), after moving the checkout,
-  or with `--remove` to take it all away.
+  ssh masters (ControlMaster) already connected to those hosts get the forwards too, for as
+  long as they run. Run it again to change the hosts (it rewrites the same block), after
+  moving the checkout, when a socket is left over (above), or with `--remove` to take it all
+  away.
 - **`bin/xray-setup-server`**, once on each host you ssh into (it asks for sudo): sets
   `StreamLocalBindUnlink yes` for sshd, in `/etc/ssh/sshd_config.d/xray-nvim.conf`. sshd
   leaves the socket of a closed connection behind, and without it refuses to forward the
@@ -292,7 +316,9 @@ with a message: set `serve.port` to another port, and forward that one.
 | `serve.host` | string | `nil` | Host the URLs name instead of `localhost`, where it names this machine or `bind` is set (fallback: `$XRAY_SERVE_HOST`) |
 | `serve.bind` | string | `nil` | Address listened on (`nil`: the one `host` names on this machine, else `127.0.0.1`; fallback: `$XRAY_SERVE_BIND`) |
 | `serve.localhost` | string | `nil` | Name that replaces `localhost` in links opened over SSH (`nil`: `host`; fallback: `$XRAY_SERVE_LOCALHOST`) |
-| `serve.open_socket` | string | `nil` | Socket forwarded to `bin/xray-open-listen` or `termux-open-url` (`nil`: `/tmp/xray-open-<user>.sock`) |
+| `serve.ui_open` | boolean | `false` | Over SSH, `vim.ui.open` (`gx`…) opens on your device too |
+| `serve.open_socket` | string | `nil` | Socket forwarded to `bin/xray-open-listen` on your PC (`nil`: `/tmp/xray-open-<user>.sock`) |
+| `serve.termux_open_socket` | string | `nil` | Socket forwarded to `termux-open-url` on the phone, tried first with Termux in front (`nil`: `/tmp/xray-open-termux-<user>.sock`) |
 | `serve.clipboard` | boolean | `true` | Copy each URL: to the phone with Termux in front, else to the `+` register |
 | `serve.termux_socket` | string | `nil` | Socket forwarded to `termux-clipboard-set` (`nil`: `/tmp/termux-clipboard-<user>-set.sock`) |
 

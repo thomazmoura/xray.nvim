@@ -6,6 +6,9 @@
 #   - a marked block at the end of ~/.ssh/config forwarding their sockets to those hosts.
 # Idempotent: running it again rewrites the same units and block.
 #
+# ssh masters already running to those hosts (ControlMaster) get the forwards too, again:
+# rerun it when Neovim over there says the socket is left over from a connection gone.
+#
 # Usage: xray-setup-client host...      the hosts as you type them after ssh
 #        xray-setup-client --remove     take the services and the block away
 #
@@ -20,7 +23,7 @@ BIN="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SERVICES=(xray-richcopy xray-open)
 
 usage() {
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -123,6 +126,45 @@ for host in "${hosts[@]}"; do
     echo "OK: $host forwards the clipboard and the browser."
   else
     echo "Warning: $host doesn't get the forwards." >&2
+    status=1
+  fi
+done
+
+# ssh masters already running (ControlMaster): their connection was set up before the
+# block, and the sessions sharing it never get its forwards. Added to each master connected
+# to one of the hosts, as ssh -O forward, for as long as it runs
+host_addresses() {
+  local name
+  name="$(ssh -F "$CONFIG" -G "$1" 2>/dev/null </dev/null | awk '$1 == "hostname" { print $2 }')"
+  [ -n "$name" ] && getent ahosts "$name" | awk '{ print $1 }' | sort -u
+}
+wanted=$(for host in "${hosts[@]}"; do host_addresses "$host"; done | sort -u)
+for pid in $(pgrep -u "$(id -u)" -x ssh); do
+  title="$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -n 1)" || continue
+  # A master renames itself "ssh: <ControlPath> [mux]"
+  [[ $title == "ssh: "*" [mux]" ]] || continue
+  control=${title#ssh: }
+  control=${control% \[mux\]}
+  peer="$(ss -tnpH state established 2>/dev/null | awk -v p="pid=$pid," 'index($0, p) { print $4; exit }')"
+  peer=${peer%:*}
+  peer=${peer#[}
+  peer=${peer%]}
+  [ -n "$peer" ] && grep -qxF "$peer" <<<"$wanted" || continue
+  # The user on the other end, through the master itself (%r of the block)
+  remote_user="$(ssh -S "$control" -o BatchMode=yes master 'id -un' 2>/dev/null </dev/null)" || continue
+  local_dir="/run/user/$(id -u)"
+  forwards=(
+    -R "/tmp/xray-richcopy-$remote_user.sock:$local_dir/xray-richcopy.sock"
+    -R "/tmp/xray-open-$remote_user.sock:$local_dir/xray-open.sock"
+  )
+  # Cancelled first: the master skips a forward it already has, though the socket over
+  # there may be gone (another connection forwarded it over this one's, then closed)
+  ssh -S "$control" -O cancel "${forwards[@]}" master 2>/dev/null || true
+  if ssh -S "$control" -O forward "${forwards[@]}" master 2>/dev/null; then
+    echo "OK: added the forwards to the ssh master already running to $peer ($control)."
+  else
+    echo "Warning: couldn't add the forwards to the ssh master to $peer: close its sessions" >&2
+    echo "  and connect again." >&2
     status=1
   fi
 done

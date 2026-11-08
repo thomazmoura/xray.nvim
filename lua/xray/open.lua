@@ -39,4 +39,25 @@ function M.html(html)
   return M.open(path)
 end
 
+-- vim.ui.open as it was before hook_ui_open
+local ui_open
+
+--- Make vim.ui.open (gx, and the plugins that call it) open on your device over SSH, as
+--- M.open does; locally it stays as it was (serve.ui_open)
+function M.hook_ui_open()
+  if ui_open then
+    return
+  end
+  ui_open = vim.ui.open
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.ui.open = function(path, opt)
+    if not require("xray.serve").remote() then
+      return ui_open(path, opt)
+    end
+    -- No process to wait for: what was done is shown, as with :Xray open
+    local err = M.open(path)
+    return nil, err
+  end
+end
+
 return M

@@ -52,6 +52,13 @@ local defaults = {
     -- ssh to bin/xray-open-listen (PC) or termux-open-url (Termux), see the README.
     -- nil: /tmp/xray-open-<user>.sock
     open_socket = nil,
+    -- The same, forwarded by the phone's ssh (Termux), tried first with Termux in front:
+    -- the PC's and the phone's connections each forward their own.
+    -- nil: /tmp/xray-open-termux-<user>.sock
+    termux_open_socket = nil,
+    -- Over SSH, vim.ui.open (gx, and the plugins that call it) opens on your device as
+    -- :Xray open does, links to localhost rewritten (see localhost below). Locally, unchanged
+    ui_open = false,
     -- Name that replaces localhost (127.0.0.1, [::1]) in the http(s) links opened over SSH,
     -- where the device cannot reach this machine's localhost, e.g. "dev.internal"
     -- (fallback: $XRAY_SERVE_LOCALHOST, then host)
@@ -94,10 +101,13 @@ local function problems()
   if not vim.tbl_contains({ "auto", "url", "local" }, serve.mode) then
     table.insert(errors, 'serve.mode must be "auto", "url" or "local"')
   end
+  if type(serve.ui_open) ~= "boolean" then
+    table.insert(errors, "serve.ui_open must be true or false")
+  end
   if type(serve.port) ~= "number" then
     table.insert(errors, "serve.port must be a number")
   end
-  for _, key in ipairs({ "host", "bind", "termux_socket", "open_socket", "localhost" }) do
+  for _, key in ipairs({ "host", "bind", "termux_socket", "open_socket", "termux_open_socket", "localhost" }) do
     if serve[key] ~= nil and type(serve[key]) ~= "string" then
       table.insert(errors, ("serve.%s must be a string"):format(key))
     end
@@ -117,6 +127,9 @@ function M.setup(opts)
   local errors = problems()
   if #errors > 0 then
     vim.notify("[xray] " .. table.concat(errors, "\n[xray] "), vim.log.levels.ERROR)
+  end
+  if config.serve.ui_open == true then
+    require("xray.open").hook_ui_open()
   end
 end
 

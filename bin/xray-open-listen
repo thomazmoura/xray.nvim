@@ -2,11 +2,25 @@
 # On the PC you ssh from: opens in its browser the URLs a Neovim over SSH opens (gb on an
 # e-mail in paperboy, :Xray open…, lua/xray/serve.lua). Listens on a Unix socket the PC's ssh
 # forwards to the remote machine (RemoteForward, see the README); each connection sends one
-# URL on a line then closes its write side, and gets "ok" back once xdg-open started.
+# URL on a line then closes its write side, and gets "ok" back once it is opened.
 # Only http:, https: and mailto: URLs are opened: never a file or another handler of this PC.
+#
+# While Termux is in front of this PC's tmux (you ssh'd from the phone into it, and on from
+# there), the URL goes on to the phone instead: through the socket the phone's ssh forwards
+# here ($XRAY_TERMUX_OPEN_SOCKET, else /tmp/xray-open-termux-<user>.sock), to
+# termux-open-url. When the phone does not answer, it opens here.
 #
 #   xray-open-listen [socket]   default: $XDG_RUNTIME_DIR/xray-open.sock
 set -eu
+
+# Whether the tmux client in front on this PC is Termux, which announces itself with
+# LC_TERMINAL=Termux in its environment (see lua/xray/client.lua)
+termux_in_front() {
+  command -v tmux >/dev/null || return 1
+  pid=$(tmux display-message -p '#{client_pid}' 2>/dev/null) || return 1
+  case $pid in '' | *[!0-9]*) return 1 ;; esac
+  tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx 'LC_TERMINAL=Termux'
+}
 
 if [ "${1:-}" = "--open" ]; then
   # One connection: the URL, alone on its line, no spaces or control characters
@@ -19,6 +33,14 @@ if [ "${1:-}" = "--open" ]; then
     echo "xray-open-listen: spaces or control characters in the URL" >&2
     exit 1
   fi
+  phone=${XRAY_TERMUX_OPEN_SOCKET:-/tmp/xray-open-termux-$(id -un).sock}
+  if [ -S "$phone" ] && termux_in_front; then
+    answer=$(printf '%s\n' "$url" | socat -t 10 - "UNIX-CONNECT:$phone" 2>/dev/null | head -n 1) || true
+    if [ "$answer" = ok ]; then
+      echo ok
+      exit 0
+    fi
+  fi
   command -v xdg-open >/dev/null || { echo "xray-open-listen: needs xdg-open" >&2; exit 1; }
   # Detached, off the connection: the browser outlives it
   setsid xdg-open "$url" </dev/null >/dev/null 2>&1 &
@@ -30,4 +52,5 @@ command -v socat >/dev/null || { echo "xray-open-listen: needs socat" >&2; exit 
 socket=${1:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR or pass the socket path}/xray-open.sock}
 self=$(readlink -f "$0")
 umask 077
-exec socat "UNIX-LISTEN:$socket,fork,unlink-early,mode=600" "EXEC:$self --open"
+# -t 15: time for the phone to answer a URL handed on to it
+exec socat -t 15 "UNIX-LISTEN:$socket,fork,unlink-early,mode=600" "EXEC:$self --open"

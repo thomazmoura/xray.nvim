@@ -72,13 +72,6 @@ function M.inline_images(html, dir)
   return result, errors
 end
 
---- Socket forwarded to the PC's listener
----@return string
-local function socket_path()
-  return require("xray").config().richcopy.socket
-    or ("/tmp/xray-richcopy-%s.sock"):format(vim.uv.os_get_passwd().username)
-end
-
 --- Page that puts the HTML on the browser's clipboard with its Copy button
 ---@param html string
 ---@param nonce string Of its one script, allowed by its policy
@@ -231,10 +224,16 @@ function M.copy(markdown, dir)
       if client.termux_in_front() then
         return copy_page_instead()
       end
-      client.send(socket_path(), '<meta charset="utf-8">' .. html, function(err)
+      client.send(client.paths().richcopy, '<meta charset="utf-8">' .. html, function(err)
         if err then
           -- No socket: no forward set up, nothing to report
-          copy_page_instead(not err:match("^no ") and (err .. ", is xray-richcopy-listen running on your PC?") or nil)
+          local reason = not err:match("^no ") and err or nil
+          if client.stale(err) then
+            reason = err .. ": " .. client.STALE_HINT
+          elseif reason then
+            reason = reason .. ", is xray-richcopy-listen running on your PC?"
+          end
+          copy_page_instead(reason)
         else
           copied("to your PC's clipboard")
         end
