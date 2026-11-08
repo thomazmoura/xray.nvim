@@ -36,11 +36,11 @@ local defaults = {
     -- Port the URLs are served from; forward it with ssh -L
     port = 8484,
     -- Host the URLs name (nil: localhost): the name your device reaches this machine by,
-    -- e.g. "dev.internal" (fallback: $XRAY_SERVE_HOST). Set bind to match
+    -- e.g. "dev.internal" (fallback: $XRAY_SERVE_HOST). Only on the machine it resolves to
+    -- (or with bind set): elsewhere the URLs stay localhost
     host = nil,
-    -- Address listened on (nil: 127.0.0.1, reached through ssh -L). "0.0.0.0", or this
-    -- machine's address on a private network (Tailscale…), for a host reached directly
-    -- (fallback: $XRAY_SERVE_BIND)
+    -- Address listened on (nil: the one host resolves to on this machine, else 127.0.0.1,
+    -- reached through ssh -L). "0.0.0.0" for all of them (fallback: $XRAY_SERVE_BIND)
     bind = nil,
     -- Copy each URL: with Termux in front, to the phone through termux_socket (forwarded to
     -- termux-clipboard-set, see the README), else to the + register (OSC 52 reaches the SSH
@@ -48,6 +48,14 @@ local defaults = {
     clipboard = true,
     -- nil: /tmp/termux-clipboard-<user>-set.sock
     termux_socket = nil,
+    -- Socket that opens each URL in the browser of the device you type on, forwarded by its
+    -- ssh to bin/xray-open-listen (PC) or termux-open-url (Termux), see the README.
+    -- nil: /tmp/xray-open-<user>.sock
+    open_socket = nil,
+    -- Name that replaces localhost (127.0.0.1, [::1]) in the http(s) links opened over SSH,
+    -- where the device cannot reach this machine's localhost, e.g. "dev.internal"
+    -- (fallback: $XRAY_SERVE_LOCALHOST, then host)
+    localhost = nil,
   },
 }
 
@@ -60,6 +68,9 @@ local function env_fallbacks()
   end
   if config.serve.bind == nil and (vim.env.XRAY_SERVE_BIND or "") ~= "" then
     config.serve.bind = vim.env.XRAY_SERVE_BIND
+  end
+  if config.serve.localhost == nil and (vim.env.XRAY_SERVE_LOCALHOST or "") ~= "" then
+    config.serve.localhost = vim.env.XRAY_SERVE_LOCALHOST
   end
 end
 
@@ -86,7 +97,7 @@ local function problems()
   if type(serve.port) ~= "number" then
     table.insert(errors, "serve.port must be a number")
   end
-  for _, key in ipairs({ "host", "bind", "termux_socket" }) do
+  for _, key in ipairs({ "host", "bind", "termux_socket", "open_socket", "localhost" }) do
     if serve[key] ~= nil and type(serve[key]) ~= "string" then
       table.insert(errors, ("serve.%s must be a string"):format(key))
     end

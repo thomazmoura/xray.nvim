@@ -2,8 +2,9 @@
 -- tablet…): there is no display on this end, so open.lua hands each file to
 -- a small HTTP server inside Neovim instead of vim.ui.open, and shows its URL, copied to
 -- the clipboard (the phone's through serve.termux_socket with Termux in front, else the +
--- register, which OSC 52 takes to the SSH client's). By default the server listens on
--- 127.0.0.1 only, reached through the SSH connection itself (ssh -L 8484:localhost:8484):
+-- register, which OSC 52 takes to the SSH client's) and opened in the device's browser
+-- through serve.open_socket, when its ssh forwards it (see client.lua). By default the
+-- server listens on 127.0.0.1 only, reached through the SSH connection itself (ssh -L 8484:localhost:8484):
 -- nothing is open on the network. serve.bind and serve.host open it to a private network
 -- instead (Tailscale…). Each file gets a URL of its own with 128 random bits in it, as the
 -- other users of this machine (or that network) can connect too. URLs work until Neovim exits.
@@ -66,6 +67,77 @@ function M.remote()
     end
   end
   return (vim.env.SSH_CONNECTION or vim.env.SSH_TTY) ~= nil
+end
+
+-- Address serve.host resolves to when it is one of this machine's, false when it is not,
+-- and the host it was resolved for (cached: resolving can take a while)
+local host_address, resolved_host
+
+--- This machine's address serve.host names, nil when it names another machine (the same
+--- configuration on every machine: only the one called so listens beyond 127.0.0.1)
+---@return string|nil
+local function local_host_address()
+  local host = options().host
+  if not host then
+    return nil
+  end
+  if resolved_host ~= host then
+    resolved_host, host_address = host, false
+    local mine = {}
+    for _, addresses in pairs(vim.uv.interface_addresses() or {}) do
+      for _, info in ipairs(addresses) do
+        mine[info.ip] = true
+      end
+    end
+    for _, info in ipairs(vim.uv.getaddrinfo(host, nil, { socktype = "stream" }) or {}) do
+      if mine[info.addr] then
+        host_address = info.addr
+        break
+      end
+    end
+  end
+  return host_address or nil
+end
+
+--- Address the server listens on: serve.bind, else the one serve.host names when it is this
+--- machine's, else 127.0.0.1 (reached through ssh -L)
+---@return string
+function M.address()
+  return options().bind or local_host_address() or "127.0.0.1"
+end
+
+--- Host the URLs name: serve.host when the server can be reached by it (serve.bind set, or it
+--- names this machine), else localhost
+---@return string
+function M.host()
+  local host = options().host
+  if host and (options().bind or local_host_address()) then
+    return host
+  end
+  return "localhost"
+end
+
+--- A link to this machine's localhost (127.0.0.1, [::1]) with serve.localhost (else the host
+--- the URLs name) in its place: the device at the other end of SSH has a localhost of its own
+---@param url string
+---@return string
+function M.rewrite_localhost(url)
+  local name = options().localhost or (M.host() ~= "localhost" and M.host()) or nil
+  if not name then
+    return url
+  end
+  local scheme, authority, rest = url:match("^(https?://)([^/?#]*)(.*)$")
+  if not scheme then
+    return url
+  end
+  local userinfo, hostport = authority:match("^(.*@)(.*)$")
+  hostport = hostport or authority
+  local host = hostport:match("^%[[^%]]*%]") or hostport:match("^[^:]*")
+  local lower = host:lower()
+  if lower ~= "localhost" and lower ~= "127.0.0.1" and lower ~= "[::1]" then
+    return url
+  end
+  return scheme .. (userinfo or "") .. name .. hostport:sub(#host + 1) .. rest
 end
 
 --- Content of a file, nil when it cannot be read
@@ -169,7 +241,7 @@ local function start()
   end
   csp = require("xray.util").BROWSER_CSP
   local wanted = options().port
-  local address = options().bind or "127.0.0.1"
+  local address = M.address()
   local tcp = vim.loop.new_tcp()
   -- libuv reports a port taken at bind or at listen
   local ok, err, name = tcp:bind(address, wanted)
@@ -227,44 +299,58 @@ function M.url(path, opts)
   local name = vim.fs.basename(path):gsub("[^%w%-%._~]", function(c)
     return ("%%%02X"):format(c:byte())
   end)
-  local host = options().host or "localhost"
-  return ("http://%s:%d/%s/%s"):format(host, port, token, name), nil
+  return ("http://%s:%d/%s/%s"):format(M.host(), port, token, name), nil
 end
 
 --- Hand something to open over to the device on the other end of SSH: a link (https:,
---- mailto:) as it is, a file as the URL serving it. Shown, and copied to the clipboard
+--- mailto:) as it is, with serve.localhost for localhost, a file as the URL serving it.
+--- Opened in the device's browser through serve.open_socket when its ssh forwards it, shown,
+--- and copied to the clipboard
 ---@param target string
 ---@param opts table|nil { csp: see M.url, message: shown before the URL (default "Open on your device") }
 ---@return string|nil error, string|nil url
 function M.open(target, opts)
   local url, err = target, nil
-  if not target:match("^%a[%w+.-]*:") then
+  if target:match("^%a[%w+.-]*:") then
+    url = M.rewrite_localhost(target)
+  else
     url, err = M.url(target, opts)
     if not url then
       return err, nil
     end
   end
+  local client = require("xray.client")
   local message = opts and opts.message or "Open on your device"
-  local function show(copied)
-    vim.notify(("[xray] %s%s: %s"):format(message, copied and (" (" .. copied .. ")") or "", url), vim.log.levels.INFO)
+  -- Both answers (opened, copied) are awaited before showing the URL once
+  local pending, opened, copied = 2, false, nil
+  local function done()
+    pending = pending - 1
+    if pending > 0 then
+      return
+    end
+    local text = opened and "Opened on your device" or message
+    vim.notify(("[xray] %s%s: %s"):format(text, copied and (" (" .. copied .. ")") or "", url), vim.log.levels.INFO)
   end
+  client.open_url(url, function(open_err)
+    opened = open_err == nil
+    done()
+  end)
   --- Copy to the + register (OSC 52 over SSH)
   local function register()
     return vim.fn.has("clipboard") == 1 and pcall(vim.fn.setreg, "+", url) and "copied" or nil
   end
   if not options().clipboard then
-    show(nil)
-    return nil, url
-  end
-  local client = require("xray.client")
-  if client.termux_in_front() then
+    done()
+  elseif client.termux_in_front() then
     -- Straight to the phone's clipboard: OSC 52 reaches Termux only if tmux forwards it
     client.termux_copy(url, function(copy_err)
-      show(copy_err and register() or "copied to the phone")
+      copied = copy_err and register() or "copied to the phone"
+      done()
     end)
-    return nil, url
+  else
+    copied = register()
+    done()
   end
-  show(register())
   return nil, url
 end
 

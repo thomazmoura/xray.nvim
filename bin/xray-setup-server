@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# On each host you ssh into and run Neovim with xray.nvim on: lets the sockets the PC or
+# phone forwards back (bin/xray-setup-client, see the README) come back on every connection.
+# Run it once; it asks for sudo.
+#
+# sshd doesn't remove a forwarded socket when the connection ends, and by default refuses to
+# bind over the one left behind, so every connection after the first would come without
+# rich copy or the browser. StreamLocalBindUnlink lets it replace the old socket.
+#
+# Idempotent: writes the drop-in only when it differs, checks the config, reloads sshd.
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+
+CONF=/etc/ssh/sshd_config.d/xray-nvim.conf
+CONTENT="# Written by xray.nvim's bin/xray-setup-server: sockets forwarded back by the ssh
+# client (RemoteForward) replace the ones earlier connections left behind.
+StreamLocalBindUnlink yes"
+
+# Captured first: grep -q quits at the match, and sshd's SIGPIPE would fail the pipe
+effective="$(sshd -T 2>/dev/null || true)"
+if grep -qix 'streamlocalbindunlink yes' <<<"$effective" && [ ! -f "$CONF" ]; then
+  echo "OK: sshd already replaces stale forwarded sockets."
+  exit 0
+fi
+
+if [ "$(cat "$CONF" 2>/dev/null)" != "$CONTENT" ]; then
+  mkdir -p "$(dirname "$CONF")"
+  printf '%s\n' "$CONTENT" >"$CONF"
+  echo "Wrote $CONF."
+fi
+
+sshd -t
+effective="$(sshd -T)"
+# The first value sshd reads wins: an earlier file in /etc/ssh may still say otherwise
+if ! grep -qix 'streamlocalbindunlink yes' <<<"$effective"; then
+  echo "Warning: sshd still has StreamLocalBindUnlink off: another file in /etc/ssh sets it" >&2
+  echo "  before $CONF does." >&2
+  exit 1
+fi
+systemctl try-reload-or-restart ssh 2>/dev/null || systemctl try-reload-or-restart sshd
+echo "OK: sshd replaces stale forwarded sockets."

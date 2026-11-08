@@ -2,7 +2,9 @@
 -- Unix sockets its ssh forwards back here (RemoteForward), each answered by a listener
 -- over there that reads a request until EOF and says "ok" once it worked:
 --   - richcopy.socket: the PC's clipboard, as text/html (bin/xray-richcopy-listen);
---   - serve.termux_socket: the phone's clipboard (termux-clipboard-set behind socat).
+--   - serve.termux_socket: the phone's clipboard (termux-clipboard-set behind socat);
+--   - serve.open_socket: the device's browser (bin/xray-open-listen on a PC,
+--     termux-open-url behind socat on the phone).
 local M = {}
 
 -- Longest wait for a listener to answer (ms)
@@ -93,6 +95,16 @@ function M.termux_copy(text, callback)
   local path = require("xray").config().serve.termux_socket
     or ("/tmp/termux-clipboard-%s-set.sock"):format(vim.uv.os_get_passwd().username)
   M.send(path, text, callback)
+end
+
+--- Open a URL in the browser of the device you type on, through serve.open_socket: the
+--- listener over there (PC or phone) knows how
+---@param url string
+---@param callback fun(err: string|nil)
+function M.open_url(url, callback)
+  local path = require("xray").config().serve.open_socket
+    or ("/tmp/xray-open-%s.sock"):format(vim.uv.os_get_passwd().username)
+  M.send(path, url .. "\n", callback)
 end
 
 return M

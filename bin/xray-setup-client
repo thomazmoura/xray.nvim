@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# On the PC you ssh from (Linux, systemd): sets up what a Neovim with xray.nvim on the hosts
+# you ssh into needs to reach this PC's clipboard and browser (see the README):
+#   - systemd user services running bin/xray-richcopy-listen (rich copy: text/html on the
+#     clipboard) and bin/xray-open-listen (URLs opened in the browser), from this checkout;
+#   - a marked block at the end of ~/.ssh/config forwarding their sockets to those hosts.
+# Idempotent: running it again rewrites the same units and block.
+#
+# Usage: xray-setup-client host...      the hosts as you type them after ssh
+#        xray-setup-client --remove     take the services and the block away
+#
+# The hosts' sshd needs StreamLocalBindUnlink yes: bin/xray-setup-server, once, there.
+set -euo pipefail
+
+BEGIN_MARK="# >>> xray.nvim: clipboard and browser over ssh >>>"
+END_MARK="# <<< xray.nvim: clipboard and browser over ssh <<<"
+CONFIG="$HOME/.ssh/config"
+UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+BIN="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SERVICES=(xray-richcopy xray-open)
+
+usage() {
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+[ "$#" -gt 0 ] || usage 1
+case $1 in -h | --help) usage ;; esac
+
+# The ssh config without our block (and the blank lines it leaves at the end)
+config_without_block() {
+  touch "$CONFIG"
+  awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip
+  ' "$CONFIG" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+}
+
+write_config() {
+  local tmp
+  tmp="$(mktemp "$CONFIG.XXXXXX")"
+  cat >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG"
+}
+
+if [ "$1" = "--remove" ]; then
+  for service in "${SERVICES[@]}"; do
+    systemctl --user disable --now "$service.service" 2>/dev/null || true
+    rm -f "$UNITS/$service.service"
+  done
+  systemctl --user daemon-reload
+  if [ -f "$CONFIG" ]; then
+    config_without_block | write_config
+  fi
+  echo "Removed the services and the block in $CONFIG."
+  exit 0
+fi
+
+hosts=("$@")
+
+missing=()
+command -v socat >/dev/null || missing+=(socat)
+command -v xdg-open >/dev/null || missing+=(xdg-utils)
+command -v wl-copy >/dev/null || command -v xclip >/dev/null || missing+=("wl-clipboard (or xclip)")
+command -v systemctl >/dev/null || { echo "xray-setup-client: needs systemd (systemctl --user)" >&2; exit 1; }
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "Warning: install ${missing[*]} (e.g. sudo apt install socat xdg-utils wl-clipboard)" >&2
+fi
+
+# The services: started with the graphical session, which hands them WAYLAND_DISPLAY/DISPLAY
+mkdir -p "$UNITS"
+write_unit() {
+  local name=$1 script=$2 does=$3
+  cat >"$UNITS/$name.service" <<EOF
+# Written by xray.nvim's bin/xray-setup-client: rerun that rather than editing this.
+[Unit]
+Description=xray.nvim: $does, for Neovim over ssh
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=$BIN/$script
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+}
+write_unit xray-richcopy xray-richcopy-listen "rich text onto this PC's clipboard"
+write_unit xray-open xray-open-listen "URLs opened in this PC's browser"
+systemctl --user daemon-reload
+for service in "${SERVICES[@]}"; do
+  systemctl --user enable "$service.service" >/dev/null
+  # Restarted: a rerun from another checkout takes over
+  systemctl --user restart "$service.service" ||
+    echo "Warning: $service didn't start: systemctl --user status $service" >&2
+done
+echo "Services enabled: ${SERVICES[*]} (from $BIN)."
+
+# The forwards, at the end: RemoteForward adds up across the blocks that match, so it
+# applies whatever comes before
+{
+  body="$(config_without_block)"
+  if [ -n "$body" ]; then printf '%s\n\n' "$body"; fi
+  echo "$BEGIN_MARK"
+  echo "# Written by xray.nvim's bin/xray-setup-client: rerun that rather than editing this."
+  echo "Host ${hosts[*]}"
+  echo "  RemoteForward /tmp/xray-richcopy-%r.sock /run/user/%i/xray-richcopy.sock"
+  echo "  RemoteForward /tmp/xray-open-%r.sock /run/user/%i/xray-open.sock"
+  echo "$END_MARK"
+} | write_config
+echo "Updated $CONFIG (Host ${hosts[*]})."
+
+status=0
+for host in "${hosts[@]}"; do
+  if ! resolved="$(ssh -F "$CONFIG" -G "$host" 2>&1 </dev/null)"; then
+    echo "Warning: ssh can't read $CONFIG for $host:" >&2
+    sed 's/^/  /' <<<"$resolved" >&2
+    status=1
+  elif [ "$(grep -ic '^remoteforward /tmp/xray-' <<<"$resolved")" -ge 2 ]; then
+    echo "OK: $host forwards the clipboard and the browser."
+  else
+    echo "Warning: $host doesn't get the forwards." >&2
+    status=1
+  fi
+done
+
+for service in "${SERVICES[@]}"; do
+  sleep 0.2
+  if [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$service.sock" ]; then
+    echo "Warning: no socket from $service yet: journalctl --user -u $service" >&2
+    status=1
+  fi
+done
+
+cat <<'EOF'
+
+Run bin/xray-setup-server once on each host (it needs sudo), then reconnect: the URLs
+Neovim opens there open in this PC's browser, and rich copy reaches this clipboard.
+EOF
+exit "$status"

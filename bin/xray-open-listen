@@ -1,0 +1,33 @@
+#!/bin/sh
+# On the PC you ssh from: opens in its browser the URLs a Neovim over SSH opens (gb on an
+# e-mail in paperboy, :Xray open…, lua/xray/serve.lua). Listens on a Unix socket the PC's ssh
+# forwards to the remote machine (RemoteForward, see the README); each connection sends one
+# URL on a line then closes its write side, and gets "ok" back once xdg-open started.
+# Only http:, https: and mailto: URLs are opened: never a file or another handler of this PC.
+#
+#   xray-open-listen [socket]   default: $XDG_RUNTIME_DIR/xray-open.sock
+set -eu
+
+if [ "${1:-}" = "--open" ]; then
+  # One connection: the URL, alone on its line, no spaces or control characters
+  url=$(head -c 65536 | head -n 1)
+  case $url in
+    http://* | https://* | mailto:*) ;;
+    *) echo "xray-open-listen: not an http(s) or mailto URL" >&2; exit 1 ;;
+  esac
+  if printf '%s' "$url" | LC_ALL=C grep -q '[^!-~]'; then
+    echo "xray-open-listen: spaces or control characters in the URL" >&2
+    exit 1
+  fi
+  command -v xdg-open >/dev/null || { echo "xray-open-listen: needs xdg-open" >&2; exit 1; }
+  # Detached, off the connection: the browser outlives it
+  setsid xdg-open "$url" </dev/null >/dev/null 2>&1 &
+  echo ok
+  exit 0
+fi
+
+command -v socat >/dev/null || { echo "xray-open-listen: needs socat" >&2; exit 1; }
+socket=${1:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR or pass the socket path}/xray-open.sock}
+self=$(readlink -f "$0")
+umask 077
+exec socat "UNIX-LISTEN:$socket,fork,unlink-early,mode=600" "EXEC:$self --open"
