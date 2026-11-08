@@ -8,8 +8,8 @@
 --   - serve.termux_open_socket: the phone's browser (termux-open-url behind socat).
 local M = {}
 
--- Longest wait for a listener to answer (ms)
-local TIMEOUT = 3000
+-- Longest wait for a listener to answer (ms): termux-open-url takes seconds
+local TIMEOUT = 10000
 
 -- What to do about a stale socket (see M.stale)
 M.STALE_HINT = "left over from an ssh connection gone, reconnect (or rerun bin/xray-setup-client on the PC)"
