@@ -44,6 +44,61 @@ local policies = {}
 -- Listening TCP handle, once started, and the port it listens on
 local server, port
 
+-- Every Neovim of this user on this machine serves the files of all of them: the URLs name
+-- one port (forwarded once, or a tunnel's), and the first to open a file takes it. Each one
+-- lists its files in a directory of its own, <state>/xray-serve/<pid>/, the token linked to
+-- the path (and <token>.csp, the policy of a page with its own), and the one listening looks
+-- there for the tokens it does not know. A Neovim leaving takes its directory away (one gone
+-- without is skipped, then removed), and another one takes over the port once it is freed.
+
+-- <state>/xray-serve, read on the main loop (vim.fn is not allowed where requests are answered)
+local root
+
+--- This Neovim's directory there
+---@return string
+local function registry()
+  root = root or vim.fn.stdpath("state") .. "/xray-serve"
+  return root .. "/" .. vim.uv.os_getpid()
+end
+
+--- Path and policy of a file another Neovim lists
+---@param token string
+---@return string|nil path, string|nil policy
+local function listed(token)
+  if not root then
+    return nil, nil
+  end
+  local scan = vim.uv.fs_scandir(root)
+  while scan do
+    local pid, kind = vim.uv.fs_scandir_next(scan)
+    if not pid then
+      break
+    end
+    if kind == "directory" and pid:match("^%d+$") and tonumber(pid) ~= vim.uv.os_getpid() then
+      local dir = root .. "/" .. pid
+      if not vim.uv.kill(tonumber(pid), 0) then
+        vim.schedule(function()
+          vim.fn.delete(dir, "rf")
+        end)
+      else
+        local path = vim.uv.fs_readlink(dir .. "/" .. token)
+        if path then
+          local file, policy = io.open(dir .. "/" .. token .. ".csp", "rb"), nil
+          if file then
+            policy = file:read("*a")
+            file:close()
+          end
+          return path, policy
+        end
+      end
+    end
+  end
+  return nil, nil
+end
+
+-- Retrying the port while another Neovim has it
+local retry
+
 -- Policy of the HTML pages served, sent as a header too (util.BROWSER_CSP)
 local csp
 
@@ -197,6 +252,11 @@ local function answer(client, head)
   end
   local token = target:match("^/(%x+)/") or target:match("^/(%x+)$")
   local path = token and files[token]
+  local policy = token and policies[token]
+  if token and not path and #token == 32 then
+    -- Another Neovim's file
+    path, policy = listed(token)
+  end
   local data = path and read_file(path)
   if not data then
     return respond(client, "404 Not Found")
@@ -206,7 +266,7 @@ local function answer(client, head)
   if not content_type then
     table.insert(headers, "Content-Disposition: attachment")
   elseif content_type:match("^text/html") then
-    table.insert(headers, "Content-Security-Policy: " .. (policies[token] or csp))
+    table.insert(headers, "Content-Security-Policy: " .. (policy or csp))
   end
   respond(client, "200 OK", headers, data, method == "HEAD")
 end
@@ -233,9 +293,33 @@ local function accept(client)
   end)
 end
 
---- Start listening, once
+--- Take this Neovim's files off the list (VimLeavePre)
+local function unregister()
+  vim.fn.delete(registry(), "rf")
+end
+
+local start
+
+--- While another Neovim has the port: take it over once it leaves, so the files listed
+--- (this one's and the others') keep being served
+local function retry_later()
+  if retry then
+    return
+  end
+  retry = vim.uv.new_timer()
+  retry:start(5000, 5000, vim.schedule_wrap(function()
+    if server or start() == nil and server then
+      retry:stop()
+      retry:close()
+      retry = nil
+    end
+  end))
+end
+
+--- Start listening, once. With the port taken by another Neovim of this user (or anything
+--- else: then its URLs do not work), carry on: that one serves the files listed
 ---@return string|nil error
-local function start()
+function start()
   if server then
     return nil
   end
@@ -258,20 +342,25 @@ local function start()
       end
     end)
   end
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = vim.api.nvim_create_augroup("xray_serve", { clear = true }),
+    callback = function()
+      unregister()
+      if server then
+        server:close()
+      end
+    end,
+  })
   if not ok then
     tcp:close()
     if name == "EADDRINUSE" then
-      return ("port %d is taken (another Neovim serving files?): set serve.port, and forward that port"):format(wanted)
+      port = wanted
+      retry_later()
+      return nil
     end
     return ("cannot listen on %s:%d: %s"):format(address, wanted, err)
   end
   server, port = tcp, wanted
-  vim.api.nvim_create_autocmd("VimLeavePre", {
-    group = vim.api.nvim_create_augroup("xray_serve", { clear = true }),
-    callback = function()
-      server:close()
-    end,
-  })
   return nil
 end
 
@@ -294,8 +383,22 @@ function M.url(path, opts)
       return ("%02x"):format(c:byte())
     end)
     files[token], tokens[path] = path, token
+    -- For whichever Neovim listens (only this user can read the list)
+    vim.fn.mkdir(registry(), "p", tonumber("700", 8))
+    vim.uv.fs_chmod(root, tonumber("700", 8))
+    vim.uv.fs_symlink(path, registry() .. "/" .. token)
   end
   policies[token] = opts and opts.csp or nil
+  local csp_file = registry() .. "/" .. token .. ".csp"
+  if policies[token] then
+    local file = io.open(csp_file, "wb")
+    if file then
+      file:write(policies[token])
+      file:close()
+    end
+  else
+    os.remove(csp_file)
+  end
   local name = vim.fs.basename(path):gsub("[^%w%-%._~]", function(c)
     return ("%%%02X"):format(c:byte())
   end)

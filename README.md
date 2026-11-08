@@ -298,8 +298,11 @@ With `serve.mode = "auto"` (default), files open as URLs when the client attache
 now came over SSH. Inside tmux, its `SSH_CONNECTION`, which tmux updates on every attach,
 tells. So the same Neovim opens the desktop's viewer when you attach from the desktop.
 `"url"` always serves, and `"local"` never does. The server starts on the first file
-served. If the port is taken, by another Neovim serving files for example, opening fails
-with a message: set `serve.port` to another port, and forward that one.
+served. Every Neovim of yours on the machine shares that one port: the first to serve a file
+listens, and serves the files of the others too, which each list theirs in
+`stdpath("state")/xray-serve/`. When it exits, its URLs stop working and another Neovim takes
+the port over within seconds. If something else holds the port, the URLs do not answer: set
+`serve.port` to another port, and forward that one.
 
 ## Configuration
 
