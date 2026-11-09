@@ -2,6 +2,7 @@
 --   - preview.lua: image previews in the terminal (Kitty graphics, Sixel or half-blocks)
 --   - richcopy.lua: Markdown copied as rich text (text/html), to paste in Teams and others
 --   - open.lua, serve.lua: files and links opened on the device at the other end of SSH
+--   - server.lua, daemon.lua: the HTTP server behind those files, shared by your Neovims
 --   - client.lua: that device, and the sockets its ssh forwards back
 -- No keymaps: map the functions (see the README).
 local M = {}
@@ -35,6 +36,10 @@ local defaults = {
     mode = "auto",
     -- Port the URLs are served from; forward it with ssh -L
     port = 8484,
+    -- Serve from a daemon all your Neovims on the machine share (started by the first to
+    -- open a file, gone once none has files listed), false: from a Neovim (the first to open
+    -- a file listens, another takes over when it leaves)
+    daemon = true,
     -- Host the URLs name (nil: localhost): the name your device reaches this machine by,
     -- e.g. "dev.internal" (fallback: $XRAY_SERVE_HOST). Only on the machine it resolves to
     -- (or with bind set): elsewhere the URLs stay localhost
@@ -101,8 +106,10 @@ local function problems()
   if not vim.tbl_contains({ "auto", "url", "local" }, serve.mode) then
     table.insert(errors, 'serve.mode must be "auto", "url" or "local"')
   end
-  if type(serve.ui_open) ~= "boolean" then
-    table.insert(errors, "serve.ui_open must be true or false")
+  for _, key in ipairs({ "ui_open", "daemon" }) do
+    if type(serve[key]) ~= "boolean" then
+      table.insert(errors, ("serve.%s must be true or false"):format(key))
+    end
   end
   if type(serve.port) ~= "number" then
     table.insert(errors, "serve.port must be a number")

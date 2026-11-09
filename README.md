@@ -171,7 +171,7 @@ Set `richcopy.socket` if the forwarded socket is not `/tmp/xray-richcopy-<user>.
 When Neovim runs on a machine you reach over SSH, from a phone in Termux, for example,
 there is no display there for `vim.ui.open`. So `require("xray.open").open(path)`
 (`:Xray open`, on the file under the cursor without an argument) serves the file from a
-small HTTP server inside Neovim instead. xray shows the URL and copies it to the clipboard, for
+small HTTP server instead (one your Neovims share, see below). xray shows the URL and copies it to the clipboard, for
 you to paste in your device's browser: to the `+` register (over SSH, Neovim copies with
 OSC 52, and inside tmux that needs `set -g set-clipboard on`), or, with Termux in front,
 straight to the phone's clipboard (below). Web and `mailto:` links are handed over as they
@@ -297,12 +297,23 @@ another path.
 With `serve.mode = "auto"` (default), files open as URLs when the client attached right
 now came over SSH. Inside tmux, its `SSH_CONNECTION`, which tmux updates on every attach,
 tells. So the same Neovim opens the desktop's viewer when you attach from the desktop.
-`"url"` always serves, and `"local"` never does. The server starts on the first file
-served. Every Neovim of yours on the machine shares that one port: the first to serve a file
-listens, and serves the files of the others too, which each list theirs in
-`stdpath("state")/xray-serve/`. When it exits, its URLs stop working and another Neovim takes
-the port over within seconds. If something else holds the port, the URLs do not answer: set
-`serve.port` to another port, and forward that one.
+`"url"` always serves, and `"local"` never does.
+
+Every Neovim of yours on the machine shares the one port, through a small daemon: the first
+Neovim to serve a file starts it (`nvim --clean --headless -l lua/xray/daemon.lua`, detached),
+and each one lists its files in `stdpath("state")/xray-serve/<pid>/`, where the daemon finds
+them. A Neovim leaving takes its URLs with it, and the daemon exits once no running Neovim has
+files listed for 90 seconds. A Neovim busy with something long does not hold the others'
+URLs up, and none of them has to stay open for the rest to keep working.
+
+The daemon keeps itself current: a Neovim finding it older than its own copy of xray (after a
+`git pull`, say) restarts it before serving its next file. `:Xray check` tells who serves the
+files, and `stdpath("state")/xray-serve/daemon.log` why a daemon did not start; a Neovim
+then serves the files itself. If something else holds the port (another program, or a
+Neovim running an xray from before the daemon: restart it), opening a file says so: set
+`serve.port` to another port, and forward that one. With `serve.daemon = false`, the first
+Neovim to serve a file listens in-process, and another takes the port over within seconds
+once it exits.
 
 ## Configuration
 
@@ -316,6 +327,7 @@ the port over within seconds. If something else holds the port, the URLs do not 
 | `richcopy.socket` | string | `nil` | Socket forwarded to `bin/xray-richcopy-listen` on your PC (`nil`: `/tmp/xray-richcopy-<user>.sock`) |
 | `serve.mode` | string | `"auto"` | Open files as URLs: `"auto"` (when attached over SSH), `"url"` (always) or `"local"` (never) |
 | `serve.port` | number | `8484` | Port the URLs are served from (forward it with `ssh -L`) |
+| `serve.daemon` | boolean | `true` | Serve from a daemon your Neovims share; `false`: from the first Neovim to serve a file |
 | `serve.host` | string | `nil` | Host the URLs name instead of `localhost`, where it names this machine or `bind` is set (fallback: `$XRAY_SERVE_HOST`) |
 | `serve.bind` | string | `nil` | Address listened on (`nil`: the one `host` names on this machine, else `127.0.0.1`; fallback: `$XRAY_SERVE_BIND`) |
 | `serve.localhost` | string | `nil` | Name that replaces `localhost` in links opened over SSH (`nil`: `host`; fallback: `$XRAY_SERVE_LOCALHOST`) |

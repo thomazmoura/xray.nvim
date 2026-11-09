@@ -1,6 +1,6 @@
 -- Opening files on another device when Neovim runs over SSH (a phone in Termux, a
 -- tablet…): there is no display on this end, so open.lua hands each file to
--- a small HTTP server inside Neovim instead of vim.ui.open, and shows its URL, copied to
+-- a small HTTP server (shared by your Neovims, see below) instead of vim.ui.open, and shows its URL, copied to
 -- the clipboard (the phone's through serve.termux_socket with Termux in front, else the +
 -- register, which OSC 52 takes to the SSH client's) and opened in the device's browser
 -- through serve.open_socket, when its ssh forwards it (see client.lua). By default the
@@ -13,94 +13,6 @@ local M = {}
 local function options()
   return require("xray").config().serve
 end
-
--- Longest request head read (bytes): a browser's request line and headers fit easily
-local MAX_HEAD = 8192
-
--- Content type of the files served, by extension: images get the extension of the format
--- found in their content, when the caller named them so). Anything else is downloaded,
--- never shown
-local TYPES = {
-  png = "image/png",
-  jpg = "image/jpeg",
-  gif = "image/gif",
-  bmp = "image/bmp",
-  tiff = "image/tiff",
-  webp = "image/webp",
-  html = "text/html; charset=utf-8",
-  pdf = "application/pdf",
-  txt = "text/plain; charset=utf-8",
-  csv = "text/plain; charset=utf-8",
-  md = "text/plain; charset=utf-8",
-  log = "text/plain; charset=utf-8",
-}
-
--- Files served: token -> path, and path -> token (a file opened again keeps its URL)
-local files, tokens = {}, {}
-
--- Policy of the HTML pages that run a script of their own (richcopy's copy page): token -> CSP
-local policies = {}
-
--- Listening TCP handle, once started, and the port it listens on
-local server, port
-
--- Every Neovim of this user on this machine serves the files of all of them: the URLs name
--- one port (forwarded once, or a tunnel's), and the first to open a file takes it. Each one
--- lists its files in a directory of its own, <state>/xray-serve/<pid>/, the token linked to
--- the path (and <token>.csp, the policy of a page with its own), and the one listening looks
--- there for the tokens it does not know. A Neovim leaving takes its directory away (one gone
--- without is skipped, then removed), and another one takes over the port once it is freed.
-
--- <state>/xray-serve, read on the main loop (vim.fn is not allowed where requests are answered)
-local root
-
---- This Neovim's directory there
----@return string
-local function registry()
-  root = root or vim.fn.stdpath("state") .. "/xray-serve"
-  return root .. "/" .. vim.uv.os_getpid()
-end
-
---- Path and policy of a file another Neovim lists
----@param token string
----@return string|nil path, string|nil policy
-local function listed(token)
-  if not root then
-    return nil, nil
-  end
-  local scan = vim.uv.fs_scandir(root)
-  while scan do
-    local pid, kind = vim.uv.fs_scandir_next(scan)
-    if not pid then
-      break
-    end
-    if kind == "directory" and pid:match("^%d+$") and tonumber(pid) ~= vim.uv.os_getpid() then
-      local dir = root .. "/" .. pid
-      if not vim.uv.kill(tonumber(pid), 0) then
-        vim.schedule(function()
-          vim.fn.delete(dir, "rf")
-        end)
-      else
-        local path = vim.uv.fs_readlink(dir .. "/" .. token)
-        if path then
-          local file, policy = io.open(dir .. "/" .. token .. ".csp", "rb"), nil
-          if file then
-            policy = file:read("*a")
-            file:close()
-          end
-          return path, policy
-        end
-      end
-    end
-  end
-  return nil, nil
-end
-
--- Retrying the port while another Neovim has it
-local retry
-
--- Policy of the HTML pages served, sent as a header too (util.BROWSER_CSP)
-local csp
 
 --- Whether files are opened as URLs: always, never, or ("auto") when the client attached
 --- now came over SSH. Inside tmux, its environment tells (updated on every attach, so a
@@ -195,120 +107,198 @@ function M.rewrite_localhost(url)
   return scheme .. (userinfo or "") .. name .. hostport:sub(#host + 1) .. rest
 end
 
---- Content of a file, nil when it cannot be read
+-- The files of every Neovim of this user on this machine are served on the one port the URLs
+-- name, by a daemon (daemon.lua) the first Neovim to open a file starts, and that leaves once
+-- none is left: each lists its files under root (see server.lua), and the daemon answers
+-- from there. When it cannot start (or with serve.daemon off), a Neovim serves them itself.
+
+local uv = vim.uv
+local server = require("xray.server")
+
+-- <state>/xray-serve
+local root
+
+--- This Neovim's directory there
+---@return string
+local function registry()
+  root = root or vim.fn.stdpath("state") .. "/xray-serve"
+  return root .. "/" .. uv.os_getpid()
+end
+
+-- Listening TCP handle, when this Neovim serves the files itself
+local inproc
+
+-- Retrying the port while something else has it (serve.daemon off)
+local retry
+
+--- Where to reach the server from this machine (it may listen on all addresses)
+---@return string
+local function connect_address()
+  local address = M.address()
+  return (address == "0.0.0.0" and "127.0.0.1") or (address == "::" and "::1") or address
+end
+
+--- GET a path from the port, waiting for the answer
 ---@param path string
----@return string|nil
-local function read_file(path)
-  local fd = vim.loop.fs_open(path, "r", 0)
-  if not fd then
-    return nil
-  end
-  local stat = vim.loop.fs_fstat(fd)
-  local data = stat and stat.type == "file" and vim.loop.fs_read(fd, stat.size, 0) or nil
-  vim.loop.fs_close(fd)
-  return data
-end
-
---- Send a response and close the connection
----@param client userdata
----@param status string
----@param headers table|nil Extra header lines
----@param body string|nil
----@param head_only boolean|nil HEAD: headers only
-local function respond(client, status, headers, body, head_only)
-  body = body or status .. "\n"
-  local lines = {
-    "HTTP/1.1 " .. status,
-    "Content-Length: " .. #body,
-    "X-Content-Type-Options: nosniff",
-    "Cache-Control: no-store",
-    "Referrer-Policy: no-referrer",
-    "Connection: close",
-  }
-  vim.list_extend(lines, headers or { "Content-Type: text/plain; charset=utf-8" })
-  local function close()
-    if not client:is_closing() then
-      client:close()
-    end
-  end
-  client:write(table.concat(lines, "\r\n") .. "\r\n\r\n" .. (head_only and "" or body), function(err)
-    -- The browser went away: no shutdown to wait for
-    if err or not client:shutdown(close) then
-      close()
-    end
-  end)
-end
-
---- Answer a request head: GET or HEAD /<token>/<name> (the name is only for the browser)
----@param client userdata
----@param head string
-local function answer(client, head)
-  local method, target = head:match("^(%u+) (%S+) HTTP/1%.%d\r\n")
-  if not method then
-    return respond(client, "400 Bad Request")
-  end
-  if method ~= "GET" and method ~= "HEAD" then
-    return respond(client, "405 Method Not Allowed", { "Content-Type: text/plain; charset=utf-8", "Allow: GET, HEAD" })
-  end
-  local token = target:match("^/(%x+)/") or target:match("^/(%x+)$")
-  local path = token and files[token]
-  local policy = token and policies[token]
-  if token and not path and #token == 32 then
-    -- Another Neovim's file
-    path, policy = listed(token)
-  end
-  local data = path and read_file(path)
-  if not data then
-    return respond(client, "404 Not Found")
-  end
-  local content_type = TYPES[(path:match("%.(%w+)$") or ""):lower()]
-  local headers = { "Content-Type: " .. (content_type or "application/octet-stream") }
-  if not content_type then
-    table.insert(headers, "Content-Disposition: attachment")
-  elseif content_type:match("^text/html") then
-    table.insert(headers, "Content-Security-Policy: " .. (policy or csp))
-  end
-  respond(client, "200 OK", headers, data, method == "HEAD")
-end
-
---- Read the request head of a new connection, then answer it
----@param client userdata
-local function accept(client)
-  local head = ""
-  client:read_start(function(err, chunk)
-    if err or not chunk then
-      if not client:is_closing() then
-        client:close()
-      end
+---@param timeout number ms
+---@return string|nil body, nil when nothing answers; "" for an answer that is not 200
+local function get(path, timeout)
+  local tcp = uv.new_tcp()
+  local chunks, done = {}, false
+  tcp:connect(connect_address(), options().port, function(err)
+    if err then
+      done = true
       return
     end
-    head = head .. chunk
-    if #head > MAX_HEAD then
-      client:read_stop()
-      respond(client, "431 Request Header Fields Too Large")
-    elseif head:find("\r\n\r\n", 1, true) then
-      client:read_stop()
-      answer(client, head)
-    end
+    tcp:read_start(function(read_err, chunk)
+      if read_err or not chunk then
+        done = true
+      else
+        table.insert(chunks, chunk)
+      end
+    end)
+    tcp:write(("GET %s HTTP/1.0\r\nHost: localhost\r\n\r\n"):format(path))
   end)
+  vim.wait(timeout, function()
+    return done
+  end, 5)
+  if not tcp:is_closing() then
+    tcp:close()
+  end
+  local response = table.concat(chunks)
+  if response == "" then
+    return nil
+  end
+  return response:match("^HTTP/1%.%d 200 [^\r\n]*\r\n.-\r\n\r\n(.*)$") or ""
 end
 
---- Take this Neovim's files off the list (VimLeavePre)
-local function unregister()
+--- The daemon's info file: id, pid, protocol, fingerprint of its code, its folder
+---@return table|nil
+local function daemon_info()
+  registry()
+  local file = io.open(root .. "/daemon", "rb")
+  if not file then
+    return nil
+  end
+  local fields = vim.split(file:read("*a"), "\n", { trimempty = true })
+  file:close()
+  return {
+    id = fields[1],
+    pid = tonumber(fields[2]),
+    protocol = tonumber(fields[3]),
+    fingerprint = fields[4],
+    dir = fields[5],
+  }
+end
+
+--- What answers on the port:
+---   - "daemon": this user's (with its info), "in-process": a Neovim's;
+---   - "other": another user's xray, "foreign": anything else (an xray from before the daemon);
+---   - nil: nothing.
+---@return string|nil state, table|nil info
+local function probe()
+  local body = get(server.HEALTH, 1000)
+  if not body then
+    return nil, nil
+  end
+  local protocol, id = body:match("^xray%-serve (%d+) (%S+)")
+  if not protocol then
+    return "foreign", nil
+  end
+  if id == "in-process" then
+    return "in-process", nil
+  end
+  local info = daemon_info()
+  if info and info.id == id then
+    return "daemon", info
+  end
+  return "other", nil
+end
+
+--- Whether the daemon runs older code than this Neovim has: an older protocol, or its
+--- files changed since (a daemon started from another copy of xray is left alone)
+---@param info table
+---@return boolean
+local function outdated(info)
+  return (info.protocol or 0) < server.PROTOCOL
+    or (info.dir == server.dir() and info.fingerprint ~= server.fingerprint())
+end
+
+--- Wait for what answers on the port to change
+---@param until_state fun(state: string|nil): boolean
+---@param timeout number ms
+---@return string|nil state, table|nil info
+local function wait_for(until_state, timeout)
+  local deadline = uv.now() + timeout
+  local state, info = probe()
+  while not until_state(state) and uv.now() < deadline do
+    vim.wait(50)
+    uv.update_time()
+    state, info = probe()
+  end
+  return state, info
+end
+
+--- Stop a daemon (one whose pid is still the daemon's), and wait for the port to be free
+---@param info table
+local function stop(info)
+  local cmdline = io.open(("/proc/%d/cmdline"):format(info.pid or 0), "rb")
+  local daemon = cmdline and cmdline:read("*a"):find("xray/daemon.lua", 1, true)
+  if cmdline then
+    cmdline:close()
+  end
+  if daemon then
+    uv.kill(info.pid, "sigterm")
+    wait_for(function(state)
+      return state ~= "daemon"
+    end, 2000)
+  end
+end
+
+--- Start the daemon, detached: it outlives this Neovim. Its output goes to <root>/daemon.log
+---@return string|nil error
+local function spawn()
+  registry()
+  local null = uv.fs_open("/dev/null", "r", 0)
+  local log = uv.fs_open(root .. "/daemon.log", "w", tonumber("600", 8))
+  local handle, err = uv.spawn(vim.v.progpath, {
+    args = { "--clean", "--headless", "-l", server.dir() .. "/daemon.lua", root, M.address(), tostring(options().port) },
+    stdio = { null, log, log },
+    detached = true,
+  }, function()
+    -- Exited (or, once this Neovim has gone, never heard of)
+  end)
+  for _, fd in ipairs({ null, log }) do
+    if fd then
+      uv.fs_close(fd)
+    end
+  end
+  if not handle then
+    return "cannot start the xray daemon: " .. tostring(err)
+  end
+  handle:unref()
+  return nil
+end
+
+--- Stop serving from this Neovim, and take its files off the list (VimLeavePre)
+local function leave()
   vim.fn.delete(registry(), "rf")
+  if inproc then
+    inproc:close()
+    inproc = nil
+  end
 end
 
-local start
+local start_inproc
 
---- While another Neovim has the port: take it over once it leaves, so the files listed
---- (this one's and the others') keep being served
+--- While another program has the port (serve.daemon off): take it over once it is freed
 local function retry_later()
   if retry then
     return
   end
-  retry = vim.uv.new_timer()
+  retry = uv.new_timer()
   retry:start(5000, 5000, vim.schedule_wrap(function()
-    if server or start() == nil and server then
+    if inproc or start_inproc() == nil and inproc then
       retry:stop()
       retry:close()
       retry = nil
@@ -316,93 +306,145 @@ local function retry_later()
   end))
 end
 
---- Start listening, once. With the port taken by another Neovim of this user (or anything
---- else: then its URLs do not work), carry on: that one serves the files listed
+--- Serve the files from this Neovim
 ---@return string|nil error
-function start()
-  if server then
+function start_inproc()
+  if inproc then
     return nil
   end
-  csp = require("xray.util").BROWSER_CSP
-  local wanted = options().port
-  local address = M.address()
-  local tcp = vim.loop.new_tcp()
-  -- libuv reports a port taken at bind or at listen
-  local ok, err, name = tcp:bind(address, wanted)
-  if ok then
-    ok, err, name = tcp:listen(16, function(listen_err)
-      if listen_err then
-        return
-      end
-      local client = vim.loop.new_tcp()
-      if tcp:accept(client) then
-        accept(client)
-      else
-        client:close()
-      end
-    end)
-  end
-  vim.api.nvim_create_autocmd("VimLeavePre", {
-    group = vim.api.nvim_create_augroup("xray_serve", { clear = true }),
-    callback = function()
-      unregister()
-      if server then
-        server:close()
-      end
-    end,
+  local tcp, err, name = server.listen({
+    root = vim.fs.dirname(registry()),
+    address = M.address(),
+    port = options().port,
+    id = "in-process",
+    csp = require("xray.util").BROWSER_CSP,
   })
-  if not ok then
-    tcp:close()
-    if name == "EADDRINUSE" then
-      port = wanted
-      retry_later()
+  if tcp then
+    inproc = tcp
+    return nil
+  end
+  if name == "EADDRINUSE" then
+    local state = probe()
+    if state == "daemon" or state == "in-process" then
       return nil
     end
-    return ("cannot listen on %s:%d: %s"):format(address, wanted, err)
+    retry_later()
   end
-  server, port = tcp, wanted
-  return nil
+  return ("cannot listen on %s:%d: %s"):format(M.address(), options().port, err)
 end
+
+--- Make sure something of this user's serves the files listed: the daemon (started, or
+--- restarted when older than this Neovim), or this Neovim
+---@return string|nil error
+local function ensure()
+  if inproc then
+    return nil
+  end
+  if not options().daemon then
+    return start_inproc()
+  end
+  local state, info = probe()
+  if state == "daemon" and outdated(info) then
+    stop(info)
+    state = probe()
+  end
+  if state == "daemon" or state == "in-process" then
+    return nil
+  elseif state == "foreign" then
+    return ("port %d is taken, by another program or an older xray in another Neovim (restart it); or set serve.port"):format(
+      options().port
+    )
+  elseif state == "other" then
+    return ("port %d is served by another user's xray: set serve.port"):format(options().port)
+  end
+  local err = spawn()
+  if not err then
+    -- Another user's for a moment: the daemon answers before its info file is written
+    state = wait_for(function(s)
+      return s == "daemon" or s == "in-process" or s == "foreign"
+    end, 3000)
+    if state == "daemon" or state == "in-process" then
+      return nil
+    end
+  end
+  -- The daemon did not come up (its reasons in <root>/daemon.log): serve from here
+  return start_inproc()
+end
+
+--- Who serves the files, for :Xray check
+---@return string
+function M.status()
+  local state, info = probe()
+  if state == "daemon" then
+    return ("the daemon, pid %d%s (log: %s/daemon.log)"):format(
+      info.pid or 0,
+      outdated(info) and ", older code: restarted with the next file opened" or "",
+      root
+    )
+  elseif state == "in-process" then
+    if not inproc then
+      return "another Neovim"
+    end
+    return options().daemon and ("this Neovim (the daemon could not start, see " .. root .. "/daemon.log)")
+      or "this Neovim (serve.daemon off)"
+  elseif state == "foreign" then
+    return "something that is not this xray: another program, or an older xray in another Neovim (restart it)"
+  elseif state == "other" then
+    return "another user's xray: set serve.port"
+  end
+  return "nothing yet: the daemon starts with the next file opened"
+end
+
+-- Tokens of the files served: path -> token (a file opened again keeps its URL)
+local tokens = {}
 
 --- URL serving a file, starting the server if needed
 ---@param path string
 ---@param opts table|nil { csp: policy of this HTML page instead of util.BROWSER_CSP }
 ---@return string|nil url, string|nil error
 function M.url(path, opts)
-  path = vim.loop.fs_realpath(path)
+  path = uv.fs_realpath(path)
   if not path then
     return nil, "no such file"
   end
-  local err = start()
-  if err then
-    return nil, err
+  local dir = registry()
+  -- Listed before the server starts: the daemon exits when nothing is
+  if vim.fn.isdirectory(dir) == 0 then
+    vim.fn.mkdir(dir, "p", tonumber("700", 8))
+    -- Only this user can read the list
+    uv.fs_chmod(root, tonumber("700", 8))
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = vim.api.nvim_create_augroup("xray_serve", { clear = true }),
+      callback = leave,
+    })
   end
   local token = tokens[path]
-  if not token then
-    token = vim.loop.random(16):gsub(".", function(c)
+  if not token or not uv.fs_readlink(dir .. "/" .. token) then
+    token = token or uv.random(16):gsub(".", function(c)
       return ("%02x"):format(c:byte())
     end)
-    files[token], tokens[path] = path, token
-    -- For whichever Neovim listens (only this user can read the list)
-    vim.fn.mkdir(registry(), "p", tonumber("700", 8))
-    vim.uv.fs_chmod(root, tonumber("700", 8))
-    vim.uv.fs_symlink(path, registry() .. "/" .. token)
+    tokens[path] = token
+    uv.fs_unlink(dir .. "/" .. token)
+    uv.fs_symlink(path, dir .. "/" .. token)
   end
-  policies[token] = opts and opts.csp or nil
-  local csp_file = registry() .. "/" .. token .. ".csp"
-  if policies[token] then
+  local csp_file = dir .. "/" .. token .. ".csp"
+  if opts and opts.csp then
     local file = io.open(csp_file, "wb")
     if file then
-      file:write(policies[token])
+      file:write(opts.csp)
       file:close()
     end
   else
     os.remove(csp_file)
   end
+  local err = ensure()
+  if err then
+    return nil, err
+  end
   local name = vim.fs.basename(path):gsub("[^%w%-%._~]", function(c)
     return ("%%%02X"):format(c:byte())
   end)
-  return ("http://%s:%d/%s/%s"):format(M.host(), port, token, name), nil
+  return ("http://%s:%d/%s/%s"):format(M.host(), options().port, token, name), nil
 end
 
 --- Hand something to open over to the device on the other end of SSH: a link (https:,

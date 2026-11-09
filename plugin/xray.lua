@@ -54,6 +54,7 @@ local subcommands = {
         require("xray").config().serve.port,
         serve.address()
       ),
+      ("served by: %s"):format(serve.status()),
       ("links to localhost open as: %s"):format(serve.rewrite_localhost("http://localhost/")),
     }
     local roles = {
